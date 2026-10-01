@@ -92,26 +92,49 @@ def find_best_contact(domain, headers, webhook_url=None):
     }
 
 
+def _walk(node):
+    """Yield every dict inside a nested JSON structure."""
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _walk(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk(v)
+
+
 def fetch_phones(cache):
     """Pull phone payloads collected by the webhook receiver and merge them into the cache."""
     hook, token = get_secret("PHONE_WEBHOOK_URL"), get_secret("PHONE_WEBHOOK_TOKEN")
     if not (hook and token):
-        return 0
+        return {"error": "PHONE_WEBHOOK_URL / PHONE_WEBHOOK_TOKEN are not set in Secrets."}
     r = requests.get(hook, params={"token": token}, timeout=30)
     r.raise_for_status()
+    try:
+        payloads = r.json()
+    except ValueError:
+        return {"error": f"Receiver did not return JSON (wrong URL or token?): {r.text[:200]}"}
+
     by_id = {}
-    for payload in r.json():
-        for person in payload.get("people", []):
-            nums = person.get("phone_numbers") or []
-            if person.get("id") and nums:
-                by_id[person["id"]] = nums[0].get("sanitized_number") or nums[0].get("raw_number")
+    for node in _walk(payloads):
+        nums = node.get("phone_numbers")
+        pid = node.get("id") or node.get("person_id")
+        if pid and isinstance(nums, list) and nums and isinstance(nums[0], dict):
+            by_id[pid] = nums[0].get("sanitized_number") or nums[0].get("raw_number")
+
     updated = 0
     for entry in cache.values():
         pid = entry.get("person_id")
-        if pid in by_id and entry.get("phone") != by_id[pid]:
+        if pid and by_id.get(pid) and entry.get("phone") != by_id[pid]:
             entry["phone"] = by_id[pid]
             updated += 1
-    return updated
+    return {
+        "payloads": len(payloads),
+        "phone_records": len(by_id),
+        "updated": updated,
+        "cached_with_id": sum(1 for e in cache.values() if e.get("person_id")),
+        "sample": payloads[-1] if payloads else None,
+    }
 
 
 def load_cache():
@@ -207,9 +230,20 @@ if st.button("Run lookup", type="primary", disabled=not todo):
     status.text(f"Done. Credits used this run: {credits_used}")
 
 if st.button("Fetch phone numbers received so far"):
-    n = fetch_phones(cache)
+    stats = fetch_phones(cache)
     save_cache(cache)
-    st.success(f"Updated {n} contacts with phone numbers. Apollo can take several minutes to deliver.")
+    if "error" in stats:
+        st.error(stats["error"])
+    else:
+        st.success(
+            f"{stats['payloads']} payloads received, {stats['phone_records']} contain phone numbers, "
+            f"{stats['updated']} matched to your contacts "
+            f"({stats['cached_with_id']} cached contacts have an Apollo ID to match on)."
+        )
+        if stats["phone_records"] and not stats["updated"]:
+            st.warning("Phones arrived but none matched. Compare the IDs below with your cache.")
+            with st.expander("Last payload received"):
+                st.json(stats["sample"])
 
 # Merge cache back onto the original rows
 out = df.copy()
