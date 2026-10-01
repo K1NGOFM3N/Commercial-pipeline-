@@ -31,6 +31,13 @@ def get_api_key() -> str | None:
         return os.environ.get("APOLLO_API_KEY")
 
 
+def get_secret(name):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name)
+
+
 def score_title(title):
     t = (title or "").lower()
     for keyword, score in TITLE_SCORES:
@@ -49,7 +56,7 @@ def clean_domain(value):
     return d.split("/")[0] or None
 
 
-def find_best_contact(domain, headers):
+def find_best_contact(domain, headers, webhook_url=None):
     payload = {
         "q_organization_domains_list": [domain],
         "person_titles": FINANCE_TITLES,
@@ -65,12 +72,12 @@ def find_best_contact(domain, headers):
         return None
     best = max(people, key=lambda p: score_title(p.get("title")))
 
-    r = requests.post(
-        f"{BASE}/people/match",
-        json={"id": best["id"], "reveal_personal_emails": False},
-        headers=headers,
-        timeout=30,
-    )
+    body = {"id": best["id"], "reveal_personal_emails": False}
+    if webhook_url:
+        # Apollo delivers phone numbers later, by POST to this URL (extra credits)
+        body["reveal_phone_number"] = True
+        body["webhook_url"] = webhook_url
+    r = requests.post(f"{BASE}/people/match", json=body, headers=headers, timeout=30)
     r.raise_for_status()
     p = r.json().get("person") or {}
     return {
@@ -79,7 +86,32 @@ def find_best_contact(domain, headers):
         "email": p.get("email"),
         "email_status": p.get("email_status"),
         "linkedin": p.get("linkedin_url"),
+        "person_id": best["id"],
+        "phone": None,
+        "phone_requested": bool(webhook_url),
     }
+
+
+def fetch_phones(cache):
+    """Pull phone payloads collected by the webhook receiver and merge them into the cache."""
+    hook, token = get_secret("PHONE_WEBHOOK_URL"), get_secret("PHONE_WEBHOOK_TOKEN")
+    if not (hook and token):
+        return 0
+    r = requests.get(hook, params={"token": token}, timeout=30)
+    r.raise_for_status()
+    by_id = {}
+    for payload in r.json():
+        for person in payload.get("people", []):
+            nums = person.get("phone_numbers") or []
+            if person.get("id") and nums:
+                by_id[person["id"]] = nums[0].get("sanitized_number") or nums[0].get("raw_number")
+    updated = 0
+    for entry in cache.values():
+        pid = entry.get("person_id")
+        if pid in by_id and entry.get("phone") != by_id[pid]:
+            entry["phone"] = by_id[pid]
+            updated += 1
+    return updated
 
 
 def load_cache():
@@ -119,9 +151,16 @@ with st.sidebar:
     st.header("Settings")
     max_credits = st.number_input("Max credits this run", 1, 5000, 10, help="Start small, then raise.")
     delay = st.slider("Delay between calls (s)", 0.0, 3.0, 1.0, 0.5)
+    reveal_phone = st.checkbox("Reveal phone numbers (costs extra credits)", value=False)
     if st.button("Clear cache"):
         save_cache({})
         st.success("Cache cleared.")
+
+phone_hook = get_secret("PHONE_WEBHOOK_URL")
+phone_token = get_secret("PHONE_WEBHOOK_TOKEN")
+webhook_url = f"{phone_hook}?token={phone_token}" if (reveal_phone and phone_hook and phone_token) else None
+if reveal_phone and not webhook_url:
+    st.sidebar.warning("Set PHONE_WEBHOOK_URL and PHONE_WEBHOOK_TOKEN in Secrets to enable phones.")
 
 file = st.file_uploader("Excel file with company domains", type=["xlsx"])
 if not file:
@@ -149,7 +188,7 @@ if st.button("Run lookup", type="primary", disabled=not todo):
             break
         status.text(f"Looking up {d} ({i + 1}/{len(todo)})")
         try:
-            result = find_best_contact(d, headers)
+            result = find_best_contact(d, headers, webhook_url)
             cache[d] = result or {"not_found": True}
             if result:
                 credits_used += 1
@@ -167,9 +206,14 @@ if st.button("Run lookup", type="primary", disabled=not todo):
         time.sleep(delay)
     status.text(f"Done. Credits used this run: {credits_used}")
 
+if st.button("Fetch phone numbers received so far"):
+    n = fetch_phones(cache)
+    save_cache(cache)
+    st.success(f"Updated {n} contacts with phone numbers. Apollo can take several minutes to deliver.")
+
 # Merge cache back onto the original rows
 out = df.copy()
-for k in ("name", "title", "email", "email_status", "linkedin"):
+for k in ("name", "title", "email", "email_status", "linkedin", "phone"):
     out[f"contact_{k}"] = out["_domain"].map(lambda d, k=k: (cache.get(d) or {}).get(k))
 out["lookup_status"] = out["_domain"].map(lambda d: status_of(cache, d))
 out = out.drop(columns="_domain")
