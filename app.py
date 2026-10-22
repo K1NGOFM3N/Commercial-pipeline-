@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import time
 
 import anthropic
@@ -395,6 +396,137 @@ def status_of(cache, d):
     return "found"
 
 
+# ---------------------------------------------------------------------------
+# Personnel in the uploaded Excel file (name, email, title)
+# ---------------------------------------------------------------------------
+
+NONE_OPTION = "(none)"
+FIRST_LAST_OPTION = "(First name + Last name columns)"
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Header keywords for each field, most specific first.
+PERSONNEL_HEADERS = {
+    "name": ["full name", "contact name", "person name", "name", "contact", "person"],
+    "email": ["email address", "work email", "email", "e-mail", "mail"],
+    "title": ["job title", "title", "position", "role", "designation"],
+}
+# Headers that look like a match but describe the company, not the person.
+NOT_PERSON_HEADERS = ("company", "organization", "organisation", "account", "domain",
+                      "website", "file", "user name", "username")
+
+
+def _norm(header):
+    return re.sub(r"[_\-]+", " ", str(header)).strip().lower()
+
+
+def guess_column(columns, field):
+    """Best guess for which column holds a field ('name', 'email' or 'title'), or None."""
+    normalized = {c: _norm(c) for c in columns}
+    candidates = [c for c, h in normalized.items() if not any(x in h for x in NOT_PERSON_HEADERS)]
+    for keyword in PERSONNEL_HEADERS[field]:          # exact header match first
+        for c in candidates:
+            if normalized[c] == keyword:
+                return c
+    for keyword in PERSONNEL_HEADERS[field]:          # then "contains"
+        for c in candidates:
+            if keyword in normalized[c]:
+                if field == "name" and ("first" in normalized[c] or "last" in normalized[c]):
+                    continue  # handled by the first + last option
+                return c
+    return None
+
+
+def find_first_last(columns):
+    """Return (first_name_col, last_name_col) if the file splits names, else (None, None)."""
+    first = next((c for c in columns if _norm(c) in ("first name", "firstname", "first", "given name")), None)
+    last = next((c for c in columns if _norm(c) in ("last name", "lastname", "last", "surname", "family name")), None)
+    return (first, last) if first and last else (None, None)
+
+
+def _cell(value):
+    return "" if pd.isna(value) else str(value).strip()
+
+
+def extract_personnel(df, name_col=None, email_col=None, title_col=None,
+                      first_col=None, last_col=None, company_col=None):
+    """Build a clean Name / Email / Title table from the uploaded rows.
+
+    Use name_col for a single full-name column, or first_col + last_col for split names.
+    Rows with no name, email or title are dropped.
+    """
+    people = pd.DataFrame(index=df.index)
+    if company_col:
+        people["Company"] = df[company_col].map(_cell)
+    if first_col and last_col:
+        people["Name"] = (df[first_col].map(_cell) + " " + df[last_col].map(_cell)).str.strip()
+    else:
+        people["Name"] = df[name_col].map(_cell) if name_col else ""
+    people["Email"] = df[email_col].map(_cell).str.lower() if email_col else ""
+    people["Title"] = df[title_col].map(_cell) if title_col else ""
+
+    has_data = (people["Name"] != "") | (people["Email"] != "") | (people["Title"] != "")
+    people = people[has_data].copy()
+    if email_col:
+        people["Email OK"] = people["Email"].map(
+            lambda e: "" if not e else ("yes" if EMAIL_RE.match(e) else "check"))
+    return people.reset_index(drop=True)
+
+
+def show_personnel(df, company_col=None):
+    """Streamlit section to review the people listed in the uploaded Excel file."""
+    columns = list(df.columns)
+    first_col, last_col = find_first_last(columns)
+
+    with st.expander("👥 Personnel in this file (name, email, title)"):
+        name_options = [NONE_OPTION] + ([FIRST_LAST_OPTION] if first_col else []) + columns
+        name_guess = guess_column(columns, "name")
+        default_name = name_guess if name_guess else (FIRST_LAST_OPTION if first_col else NONE_OPTION)
+
+        def pick(label, field, options, default):
+            return st.selectbox(label, options, index=options.index(default), key=f"personnel_{field}")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            name_choice = pick("Name column", "name", name_options, default_name)
+        with c2:
+            email_guess = guess_column(columns, "email") or NONE_OPTION
+            email_choice = pick("Email column", "email", [NONE_OPTION] + columns, email_guess)
+        with c3:
+            title_guess = guess_column(columns, "title") or NONE_OPTION
+            title_choice = pick("Title column", "title", [NONE_OPTION] + columns, title_guess)
+
+        if (name_choice, email_choice, title_choice) == (NONE_OPTION, NONE_OPTION, NONE_OPTION):
+            st.info("No name, email or title columns found. If they're named differently, "
+                    "pick them above.")
+            return
+
+        use_split = name_choice == FIRST_LAST_OPTION
+        people = extract_personnel(
+            df,
+            name_col=None if use_split or name_choice == NONE_OPTION else name_choice,
+            email_col=None if email_choice == NONE_OPTION else email_choice,
+            title_col=None if title_choice == NONE_OPTION else title_choice,
+            first_col=first_col if use_split else None,
+            last_col=last_col if use_split else None,
+            company_col=company_col,
+        )
+
+        query = st.text_input("Search name, email or title", key="personnel_search").strip().lower()
+        if query:
+            text = people.drop(columns=[c for c in ("Email OK",) if c in people]).astype(str)
+            people = people[text.apply(lambda r: query in " ".join(r).lower(), axis=1)]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("People", len(people))
+        m2.metric("With email", int((people["Email"] != "").sum()))
+        if "Email OK" in people:
+            m3.metric("Emails to check", int((people["Email OK"] == "check").sum()))
+
+        st.dataframe(people, use_container_width=True, hide_index=True)
+        st.download_button("Download personnel (CSV)", people.to_csv(index=False),
+                           "personnel.csv", mime="text/csv", key="personnel_download")
+
+
 st.set_page_config(page_title="Buyer Finder", page_icon="📇", layout="wide")
 st.title("📇 Buyer Finder")
 st.caption("Upload a company list; Apollo finds candidates and Claude picks the best person to pitch.")
@@ -435,6 +567,8 @@ df = pd.read_excel(file)
 col = st.selectbox("Which column holds the domain?", df.columns)
 df["_domain"] = df[col].map(clean_domain)
 domains = list(dict.fromkeys(df["_domain"].dropna()))
+
+show_personnel(df, company_col=col)
 
 cache = load_cache()
 # Errored lookups are retried; found and not_found results are kept.
