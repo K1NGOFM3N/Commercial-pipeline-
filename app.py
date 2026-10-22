@@ -92,7 +92,7 @@ How to judge:
 - Rank only candidates who are plausibly relevant; return an empty list if none are."""
 
 
-#def get_secret(name):
+def get_secret(name):
     try:
         return st.secrets[name]
     except Exception:
