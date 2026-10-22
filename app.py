@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+from urllib.parse import unquote, urlparse
 
 import anthropic
 import pandas as pd
@@ -397,6 +398,110 @@ def status_of(cache, d):
 
 
 # ---------------------------------------------------------------------------
+# Identify companies by their LinkedIn page
+# ---------------------------------------------------------------------------
+# LinkedIn itself is not scraped (that breaks LinkedIn's terms and gets blocked).
+# Instead, each LinkedIn URL is matched to Apollo's company record, and a match only
+# counts when Apollo's LinkedIn URL for that company is the same page.
+
+LINKEDIN_CACHE_FILE = "linkedin_cache.json"
+COMPANY_SUFFIXES = {"inc", "llc", "ltd", "limited", "corp", "corporation", "co", "company",
+                    "gmbh", "plc", "pty", "sa", "ag", "bv", "group", "hq", "official", "global"}
+
+
+def normalize_linkedin(value):
+    """'https://www.linkedin.com/company/acme-inc/about/?x=1' -> 'linkedin.com/company/acme-inc'.
+
+    Returns None for anything that isn't a LinkedIn company page (e.g. a personal /in/ profile).
+    """
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if "://" not in text:
+        text = "https://" + text
+    parsed = urlparse(text)
+    host = parsed.netloc.lower()
+    if not (host == "linkedin.com" or host.endswith(".linkedin.com")):
+        return None
+    parts = [unquote(p).lower() for p in parsed.path.split("/") if p]
+    if len(parts) < 2 or parts[0] not in ("company", "school", "showcase"):
+        return None
+    return f"linkedin.com/{parts[0]}/{parts[1]}"
+
+
+def linkedin_search_names(normalized):
+    """Company names to search for, built from the LinkedIn URL's slug."""
+    slug = normalized.rsplit("/", 1)[-1]
+    words = [w for w in re.split(r"[-_]+", slug) if w and not w.isdigit()]
+    if not words:
+        return []  # numeric-only URL like /company/1234567
+    names = [" ".join(words)]
+    trimmed = [w for w in words if w not in COMPANY_SUFFIXES]
+    if trimmed and trimmed != words:
+        names.append(" ".join(trimmed))
+    return names
+
+
+def resolve_linkedin_company(normalized, headers, meter):
+    """Find the Apollo company whose LinkedIn page is exactly this one."""
+    names = linkedin_search_names(normalized)
+    if not names:
+        return {"status": "not_matched",
+                "note": "Numeric LinkedIn URL. Use the company's named URL (linkedin.com/company/name)."}
+    seen = []
+    for name in names:
+        r = requests.post(f"{BASE}/mixed_companies/search",
+                          json={"q_organization_name": name, "per_page": 25, "page": 1},
+                          headers=headers, timeout=30)
+        meter["credits"] += 1
+        r.raise_for_status()
+        data = r.json()
+        orgs = (data.get("organizations") or []) + (data.get("accounts") or [])
+        for org in orgs:
+            if normalize_linkedin(org.get("linkedin_url")) == normalized:
+                domain = clean_domain(org.get("primary_domain") or org.get("website_url"))
+                info = {
+                    "company_name": org.get("name"),
+                    "domain": domain,
+                    "employees": org.get("estimated_num_employees"),
+                    "industry": org.get("industry"),
+                    "location": ", ".join(x for x in (org.get("city"), org.get("country")) if x) or None,
+                    "apollo_org_id": org.get("id") or org.get("organization_id"),
+                }
+                if not domain:
+                    return {"status": "not_matched", **info,
+                            "note": "Company found, but Apollo has no website for it."}
+                return {"status": "matched", **info}
+            seen.append(org.get("name"))
+    note = "No Apollo company has this exact LinkedIn page."
+    if seen:
+        note += f" Closest names: {', '.join(dict.fromkeys(n for n in seen if n))[:150]}"
+    return {"status": "not_matched", "note": note}
+
+
+def load_linkedin_cache():
+    if os.path.exists(LINKEDIN_CACHE_FILE):
+        with open(LINKEDIN_CACHE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_linkedin_cache(li_cache):
+    with open(LINKEDIN_CACHE_FILE, "w") as f:
+        json.dump(li_cache, f, indent=2)
+
+
+def domains_agree(listed, from_linkedin):
+    """Compare a listed domain with LinkedIn's, ignoring subdomains like 'app.' or 'shop.'."""
+    if not listed or not from_linkedin:
+        return None
+    base = lambda d: ".".join(d.split(".")[-2:])
+    return listed == from_linkedin or base(listed) == base(from_linkedin)
+
+
+# ---------------------------------------------------------------------------
 # Personnel in the uploaded Excel file (name, email, title)
 # ---------------------------------------------------------------------------
 
@@ -564,8 +669,99 @@ if not file:
     st.stop()
 
 df = pd.read_excel(file)
-col = st.selectbox("Which column holds the domain?", df.columns)
-df["_domain"] = df[col].map(clean_domain)
+columns = list(df.columns)
+id_mode = st.radio("How should companies be identified?",
+                   ["Website domain", "Company LinkedIn page"], horizontal=True)
+use_linkedin = id_mode == "Company LinkedIn page"
+li_cache = {}
+
+if not use_linkedin:
+    col = st.selectbox("Which column holds the domain?", columns)
+    df["_domain"] = df[col].map(clean_domain)
+else:
+    li_guess = next((c for c in columns if "linkedin" in str(c).lower()), columns[0])
+    col = st.selectbox("Which column holds the company LinkedIn URL?", columns,
+                       index=columns.index(li_guess))
+    check_options = ["(don't cross-check)"] + [c for c in columns if c != col]
+    domain_guess = next((c for c in check_options[1:]
+                         if any(k in str(c).lower() for k in ("domain", "website", "url"))
+                         and "linkedin" not in str(c).lower()), check_options[0])
+    check_col = st.selectbox("Domain column to cross-check against LinkedIn (optional)", check_options,
+                             index=check_options.index(domain_guess))
+    check_col = None if check_col == check_options[0] else check_col
+
+    li_cache = load_linkedin_cache()
+    df["_linkedin"] = df[col].map(normalize_linkedin)
+    urls = list(dict.fromkeys(df["_linkedin"].dropna()))
+    unchecked = [u for u in urls if u not in li_cache or li_cache[u].get("status") == "error"]
+    bad_urls = int((df[col].notna() & df["_linkedin"].isna()).sum())
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("LinkedIn pages", len(urls))
+    k2.metric("Matched", sum(1 for u in urls if (li_cache.get(u) or {}).get("status") == "matched"))
+    k3.metric("Not matched", sum(1 for u in urls if (li_cache.get(u) or {}).get("status") == "not_matched"))
+    k4.metric("To check", len(unchecked))
+    if bad_urls:
+        st.warning(f"{bad_urls} rows don't contain a LinkedIn company URL "
+                   "(linkedin.com/company/...). Personal profiles (/in/) can't identify a company.")
+
+    if st.button("Check companies on LinkedIn", disabled=not unchecked,
+                 help="Matches each LinkedIn page to Apollo's company record. "
+                      "May use Apollo credits (1-2 searches per company), counted toward your cap."):
+        li_meter = {"credits": 0}
+        li_bar = st.progress(0.0)
+        li_status = st.empty()
+        for i, u in enumerate(unchecked):
+            if li_meter["credits"] + 2 > max_credits:
+                st.warning(f"Credit cap ({max_credits}) reached. Raise it and check again to continue.")
+                break
+            li_status.text(f"Checking {u} ({i + 1}/{len(unchecked)})")
+            for attempt in range(3):
+                try:
+                    li_cache[u] = resolve_linkedin_company(u, headers, li_meter)
+                    break
+                except requests.HTTPError as e:
+                    code = e.response.status_code
+                    if code == 429 and attempt < 2:
+                        li_status.text("Apollo rate limit, waiting 60s...")
+                        time.sleep(60)
+                        continue
+                    li_cache[u] = {"status": "error", "note": f"HTTP {code}"}
+                    break
+                except Exception as e:
+                    li_cache[u] = {"status": "error", "note": str(e)}
+                    break
+            save_linkedin_cache(li_cache)
+            li_bar.progress((i + 1) / len(unchecked))
+            time.sleep(delay)
+        st.rerun()
+
+    df["_domain"] = df["_linkedin"].map(lambda u: (li_cache.get(u) or {}).get("domain")
+                                        if (li_cache.get(u) or {}).get("status") == "matched" else None)
+
+    checked = [u for u in urls if u in li_cache]
+    if checked:
+        with st.expander("🔎 Company check (from LinkedIn)", expanded=True):
+            rows = []
+            listed = (df.dropna(subset=["_linkedin"]).drop_duplicates("_linkedin")
+                      .set_index("_linkedin")[check_col].map(clean_domain)) if check_col else {}
+            for u in checked:
+                info = li_cache[u]
+                row = {"LinkedIn": u, "Status": info.get("status"), "Company": info.get("company_name"),
+                       "Domain": info.get("domain"), "Employees": info.get("employees"),
+                       "Industry": info.get("industry"), "Location": info.get("location"),
+                       "Note": info.get("note")}
+                if check_col:
+                    agree = domains_agree(listed.get(u), info.get("domain"))
+                    row["Listed domain"] = listed.get(u)
+                    row["Domain check"] = {True: "matches", False: "differs", None: ""}[agree]
+                rows.append(row)
+            check_df = pd.DataFrame(rows)
+            st.dataframe(check_df, use_container_width=True, hide_index=True)
+            if check_col and (check_df["Domain check"] == "differs").any():
+                st.warning("Some listed domains differ from the company's LinkedIn. "
+                           "The LinkedIn match is used for the lookup.")
+
 domains = list(dict.fromkeys(df["_domain"].dropna()))
 
 show_personnel(df, company_col=col)
@@ -631,11 +827,24 @@ for k in ("name", "title", "email", "email_status", "linkedin", "phone",
           "confidence", "rationale", "pitch_angle", "alternates", "picked_by"):
     out[f"contact_{k}"] = out["_domain"].map(lambda d, k=k: (cache.get(d) or {}).get(k))
 out["lookup_status"] = out["_domain"].map(lambda d: status_of(cache, d))
-out = out.drop(columns="_domain")
+if use_linkedin:
+    li_info = out["_linkedin"].map(lambda u: li_cache.get(u) or {})
+    out["linkedin_company"] = li_info.map(lambda i: i.get("company_name"))
+    out["linkedin_domain"] = li_info.map(lambda i: i.get("domain"))
+    out["linkedin_employees"] = li_info.map(lambda i: i.get("employees"))
+    out["linkedin_industry"] = li_info.map(lambda i: i.get("industry"))
+    li_state = li_info.map(lambda i: i.get("status"))
+    no_domain = out["_domain"].isna()
+    out.loc[no_domain & out["_linkedin"].isna(), "lookup_status"] = "linkedin_invalid"
+    out.loc[no_domain & out["_linkedin"].notna() & li_state.isna(), "lookup_status"] = "linkedin_unchecked"
+    out.loc[no_domain & (li_state == "not_matched"), "lookup_status"] = "linkedin_not_matched"
+    out.loc[no_domain & (li_state == "error"), "lookup_status"] = "linkedin_error"
+out = out.drop(columns=[c for c in ("_domain", "_linkedin") if c in out])
 
 st.subheader("Results")
-choice = st.multiselect("Filter by status", ["found", "not_found", "error", "pending"],
-                        default=["found", "not_found", "error", "pending"])
+status_options = ["found", "not_found", "error", "pending"] + sorted(
+    s for s in out["lookup_status"].dropna().unique() if s.startswith("linkedin_"))
+choice = st.multiselect("Filter by status", status_options, default=status_options)
 st.dataframe(out[out["lookup_status"].isin(choice)], use_container_width=True)
 
 buf = io.BytesIO()
