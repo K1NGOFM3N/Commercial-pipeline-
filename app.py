@@ -632,6 +632,459 @@ def show_personnel(df, company_col=None):
                            "personnel.csv", mime="text/csv", key="personnel_download")
 
 
+# ---------------------------------------------------------------------------
+# Person lookup tab: find specific people by name, email, title and company
+# ---------------------------------------------------------------------------
+
+PEOPLE_CACHE_FILE = "people_cache.json"
+TITLE_STOPWORDS = {"of", "and", "the", "for", "at", "to", "in"}
+TITLE_ABBREVIATIONS = {
+    "ceo": "chief executive officer", "cfo": "chief financial officer", "coo": "chief operating officer",
+    "cto": "chief technology officer", "cio": "chief information officer", "cro": "chief revenue officer",
+    "cmo": "chief marketing officer", "vp": "vice president", "svp": "senior vice president",
+    "evp": "executive vice president", "md": "managing director", "gm": "general manager",
+    "sr": "senior", "dir": "director", "mgr": "manager", "ops": "operations", "fin": "finance",
+}
+
+
+def _tokens(text):
+    return [t for t in re.split(r"[^a-z0-9]+", str(text or "").lower()) if t]
+
+
+def _title_words(title):
+    words = []
+    for t in _tokens(title):
+        words += TITLE_ABBREVIATIONS.get(t, t).split()
+    return [w for w in words if w not in TITLE_STOPWORDS]
+
+
+def split_name(name):
+    parts = str(name or "").split()
+    if not parts:
+        return None, None
+    return parts[0], (parts[-1] if len(parts) > 1 else None)
+
+
+def resolve_company_input(company, headers, meter, li_cache):
+    """Turn a company domain, company LinkedIn URL, or company name into lookup details."""
+    text = str(company or "").strip()
+    if not text:
+        return {}
+    li = normalize_linkedin(text)
+    if li:
+        info = li_cache.get(li)
+        if not info or info.get("status") == "error":
+            info = resolve_linkedin_company(li, headers, meter)
+            li_cache[li] = info
+            save_linkedin_cache(li_cache)
+        matched = info.get("status") == "matched"
+        return _compact({"linkedin": li, "domain": info.get("domain") if matched else None,
+                         "company_name": info.get("company_name"),
+                         "note": None if matched else info.get("note")})
+    if "linkedin.com" in text.lower():
+        return {"note": "That LinkedIn link isn't a company page (linkedin.com/company/...)."}
+    domain = clean_domain(text)
+    if domain and "." in domain and " " not in domain:
+        return {"domain": domain}
+    return {"company_name": text}
+
+
+def check_person(p, name, email, title, company):
+    """Compare a person Apollo returned with what was asked for.
+    Each check is True (matches), False (differs) or None (couldn't verify)."""
+    checks = {}
+    if name:
+        want_first, want_last = split_name(name.lower())
+        got_first = (p.get("first_name") or "").lower()
+        got_last = (p.get("last_name") or "").lower()
+        hidden_last = (p.get("last_name_obfuscated") or "").lower()
+        first_ok = got_first == want_first
+        if not want_last:
+            last_ok = True
+        elif got_last:
+            last_ok = got_last == want_last or want_last in got_last.split()
+        elif hidden_last:
+            last_ok = hidden_last[:1] == want_last[:1]  # search results hide most of the last name
+        else:
+            last_ok = False
+        checks["Name"] = first_ok and last_ok
+    if email:
+        got_email = (p.get("email") or "").lower()
+        checks["Email"] = (got_email == email.lower()) if got_email else None
+    if title:
+        want = _title_words(title)
+        got = set(_title_words(p.get("title")))
+        checks["Title"] = all(w in got for w in want) if (want and got) else None
+    if company:
+        org = p.get("organization") or {}
+        got_domain = clean_domain(org.get("primary_domain") or org.get("website_url") or "")
+        got_name = org.get("name") or p.get("organization_name") or ""
+        if company.get("domain") and got_domain:
+            checks["Company"] = domains_agree(company["domain"], got_domain)
+        elif company.get("linkedin") and org.get("linkedin_url"):
+            checks["Company"] = normalize_linkedin(org["linkedin_url"]) == company["linkedin"]
+        elif company.get("company_name") and got_name:
+            want = [t for t in _tokens(company["company_name"]) if t not in COMPANY_SUFFIXES]
+            checks["Company"] = all(t in _tokens(got_name) for t in want) if want else None
+        else:
+            checks["Company"] = None
+    return checks
+
+
+def match_status(checks):
+    if any(v is False for v in checks.values()):
+        return "partial match"
+    if any(v is None for v in checks.values()):
+        return "match (some details unverified)"
+    return "exact match"
+
+
+def person_record(p, pid=None):
+    org = p.get("organization") or {}
+    return _compact({
+        "id": pid or p.get("id"),
+        "name": full_name(p),
+        "title": p.get("title"),
+        "company": org.get("name") or p.get("organization_name"),
+        "company_domain": clean_domain(org.get("primary_domain") or org.get("website_url") or ""),
+        "email": p.get("email"),
+        "email_status": p.get("email_status"),
+        "linkedin": p.get("linkedin_url"),
+        "location": ", ".join(x for x in (p.get("city"), p.get("state"), p.get("country")) if x) or None,
+    })
+
+
+def lookup_person(name, email, title, company_text, headers, meter, li_cache):
+    """Find one specific person.
+
+    1. Direct match (people/match, 1 credit) when there's an email, or a name plus a company.
+    2. Otherwise, or if that finds nobody: a free search within the company by name and/or title.
+       Search results have no emails; enrich a candidate to get contact details.
+    """
+    name, email, title = (str(x or "").strip() for x in (name, email, title))
+    email = email.lower()
+    company = resolve_company_input(company_text, headers, meter, li_cache)
+    result = {"person": None, "checks": {}, "status": "not found", "candidates": [],
+              "company": company, "note": company.get("note")}
+
+    can_match = bool(email or (name and (company.get("domain") or company.get("company_name"))))
+    if can_match:
+        first, last = split_name(name)
+        body = _compact({
+            "email": email or None, "name": name or None, "first_name": first, "last_name": last,
+            "domain": company.get("domain"),
+            "organization_name": None if company.get("domain") else company.get("company_name"),
+        })
+        body["reveal_personal_emails"] = False
+        r = requests.post(f"{BASE}/people/match", json=body, headers=headers, timeout=30)
+        meter["credits"] += 1
+        r.raise_for_status()
+        p = r.json().get("person")
+        if p:
+            checks = check_person(p, name, email, title, company)
+            result.update(person=person_record(p), checks=checks, status=match_status(checks))
+            return result
+
+    if company.get("domain") and (name or title):
+        payload = {"q_organization_domains_list": [company["domain"]], "per_page": 25, "page": 1}
+        if title:
+            payload["person_titles"] = [title]
+            payload["include_similar_titles"] = False
+        if name:
+            payload["q_keywords"] = name
+        r = requests.post(f"{BASE}/mixed_people/api_search", json=payload, headers=headers, timeout=30)
+        r.raise_for_status()
+        candidates = []
+        for p in r.json().get("people", []):
+            if not p.get("id"):
+                continue
+            checks = check_person(p, name, None, title, None)
+            checks["Company"] = True  # searched inside this company only
+            candidates.append({**person_record(p), "match": match_status(checks), "checks": checks})
+        rank = {"exact match": 0, "match (some details unverified)": 1, "partial match": 2}
+        candidates.sort(key=lambda c: rank.get(c["match"], 3))
+        result["candidates"] = candidates
+        if candidates:
+            result["status"] = "candidates found"
+    elif not can_match and not result["note"]:
+        result["note"] = ("Add an email, or a name plus a company. To list people by title, "
+                          "add a title plus a company domain or LinkedIn page.")
+    return result
+
+
+def lookup_with_retry(fn, wait_note=None):
+    for attempt in range(3):
+        try:
+            return fn()
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429 and attempt < 2:
+                if wait_note:
+                    wait_note.text("Apollo rate limit, waiting 60s...")
+                time.sleep(60)
+                continue
+            raise
+
+
+def load_people_cache():
+    if os.path.exists(PEOPLE_CACHE_FILE):
+        with open(PEOPLE_CACHE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_people_cache(people_cache):
+    with open(PEOPLE_CACHE_FILE, "w") as f:
+        json.dump(people_cache, f, indent=2)
+
+
+def people_cache_key(name, email, title, company):
+    return json.dumps([str(x or "").strip().lower() for x in (name, email, title, company)])
+
+
+CHECK_ICONS = {True: "✅", False: "❌", None: "➖"}
+
+
+def checks_text(checks):
+    return "  ".join(f"{k} {CHECK_ICONS[v]}" for k, v in checks.items())
+
+
+def _blank(value):
+    return value is None or (not isinstance(value, str) and pd.isna(value)) or str(value).strip() == ""
+
+
+def single_person_lookup():
+    st.markdown("Enter whatever you know. An **email**, or a **name plus a company**, finds a specific "
+                "person. A **title plus a company** lists the people in that role.")
+    with st.form("person_form"):
+        c1, c2 = st.columns(2)
+        name = c1.text_input("Full name", placeholder="Jane Doe", key="person_name")
+        email = c2.text_input("Email", placeholder="jane@acme.com", key="person_email")
+        title = c1.text_input("Job title", placeholder="Controller", key="person_title")
+        company = c2.text_input("Company domain or company LinkedIn page",
+                                placeholder="acme.com or linkedin.com/company/acme", key="person_company")
+        submitted = st.form_submit_button("Look up person", type="primary")
+
+    if submitted:
+        if not any((name.strip(), email.strip(), title.strip(), company.strip())):
+            st.warning("Fill in at least one field.")
+            return
+        people_cache = load_people_cache()
+        key = people_cache_key(name, email, title, company)
+        if key in people_cache:
+            st.session_state.person_result = people_cache[key]
+            st.session_state.person_result_cached = True
+        else:
+            li_cache = load_linkedin_cache()
+            meter = {"credits": 0}
+            try:
+                with st.spinner("Searching Apollo…"):
+                    res = lookup_with_retry(lambda: lookup_person(name, email, title, company,
+                                                                  headers, meter, li_cache))
+            except requests.HTTPError as e:
+                st.error(f"Apollo error: HTTP {e.response.status_code}")
+                return
+            except Exception as e:
+                st.error(f"Lookup failed: {e}")
+                return
+            res["inputs"] = {"name": name, "email": email, "title": title, "company": company}
+            people_cache[key] = res
+            save_people_cache(people_cache)
+            st.session_state.person_result = res
+            st.session_state.person_result_cached = False
+            st.caption(f"Apollo credits used: {meter['credits']}")
+
+    res = st.session_state.get("person_result")
+    if not res:
+        return
+    if st.session_state.get("person_result_cached"):
+        st.caption("Saved result, no credits used.")
+    if res.get("note"):
+        st.info(res["note"])
+
+    if res.get("person"):
+        p = res["person"]
+        status = res["status"]
+        (st.success if status == "exact match" else st.warning)(f"**{status.capitalize()}**")
+        st.markdown(f"### {p.get('name', '')}")
+        st.markdown(f"{p.get('title', '')} · {p.get('company', '')} ({p.get('company_domain', '')})")
+        details = {"Email": p.get("email"), "Email status": p.get("email_status"),
+                   "LinkedIn": p.get("linkedin"), "Location": p.get("location")}
+        for label, value in details.items():
+            if value:
+                st.markdown(f"**{label}:** {value}")
+        if res.get("checks"):
+            st.markdown("**Checks against what you entered:** " + checks_text(res["checks"]))
+            st.caption("✅ matches · ❌ differs · ➖ couldn't verify")
+        return
+
+    cands = res.get("candidates") or []
+    if not cands:
+        st.error("No one found.")
+        return
+
+    st.markdown(f"**{len(cands)} people found at this company.** Search results don't include emails; "
+                "get contact details for the right person below.")
+    table = pd.DataFrame([{"Name": c.get("name"), "Title": c.get("title"), "Match": c["match"],
+                           "Checks": checks_text(c["checks"]), "Location": c.get("location")}
+                          for c in cands])
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    labels = [f"{c.get('name')} — {c.get('title')}" for c in cands]
+    pick = st.selectbox("Person to get contact details for", range(len(cands)),
+                        format_func=lambda i: labels[i], key="person_candidate")
+    if st.button("Get contact details (1 Apollo credit)", key="person_enrich"):
+        cand = cands[pick]
+        try:
+            p = lookup_with_retry(lambda: apollo_match(cand["id"], headers))
+        except Exception as e:
+            st.error(f"Couldn't get details: {e}")
+            return
+        if not p:
+            st.error("Apollo returned no details for this person.")
+            return
+        inputs = res.get("inputs", {})
+        checks = check_person(p, inputs.get("name"), inputs.get("email"), inputs.get("title"),
+                              res.get("company"))
+        res.update(person=person_record(p, cand["id"]), checks=checks, status=match_status(checks))
+        people_cache = load_people_cache()
+        people_cache[people_cache_key(**inputs)] = res
+        save_people_cache(people_cache)
+        st.session_state.person_result = res
+        st.rerun()
+
+
+def guess_company_linkedin_column(df):
+    """The column whose values are mostly LinkedIn company pages."""
+    best, best_share = None, 0.0
+    for c in df.columns:
+        values = df[c].dropna().astype(str).head(50)
+        if values.empty:
+            continue
+        share = values.map(lambda v: normalize_linkedin(v) is not None).mean()
+        if share > best_share:
+            best, best_share = c, share
+    return best if best_share >= 0.5 else None
+
+
+def bulk_person_lookup():
+    st.markdown("Upload a list of people to check them all at once. Results are saved, "
+                "so re-running a row doesn't use credits again.")
+    up = st.file_uploader("Excel or CSV file with people", type=["xlsx", "csv"], key="people_file")
+    if not up:
+        return
+    pdf = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
+    columns = list(pdf.columns)
+    first_col, last_col = find_first_last(columns)
+    none = NONE_OPTION
+
+    def choose(where, label, options, guess, key):
+        return where.selectbox(label, options, index=options.index(guess) if guess in options else 0,
+                               key=key)
+
+    name_opts = [none] + ([FIRST_LAST_OPTION] if first_col else []) + columns
+    name_guess = guess_column(columns, "name") or (FIRST_LAST_OPTION if first_col else none)
+    domain_guess = next((c for c in columns if any(k in _norm(c) for k in ("domain", "website"))
+                         and "linkedin" not in _norm(c)), none)
+
+    c1, c2, c3 = st.columns(3)
+    name_c = choose(c1, "Name", name_opts, name_guess, "bulk_name")
+    email_c = choose(c2, "Email", [none] + columns, guess_column(columns, "email"), "bulk_email")
+    title_c = choose(c3, "Title", [none] + columns, guess_column(columns, "title"), "bulk_title")
+    d1, d2, d3 = st.columns(3)
+    domain_c = choose(d1, "Company domain", [none] + columns, domain_guess, "bulk_domain")
+    li_c = choose(d2, "Company LinkedIn page", [none] + columns,
+                  guess_company_linkedin_column(pdf) or none, "bulk_li")
+    exact_only = d3.toggle("Only keep exact matches", value=True, key="bulk_exact",
+                           help="Off: also show partial matches, e.g. same person with a different title.")
+
+    def val(row, c):
+        return "" if c == none or _blank(row[c]) else str(row[c]).strip()
+
+    rows = []
+    for _, row in pdf.iterrows():
+        if name_c == FIRST_LAST_OPTION:
+            nm = f"{val(row, first_col)} {val(row, last_col)}".strip()
+        else:
+            nm = val(row, name_c)
+        company = val(row, domain_c) or val(row, li_c)
+        rows.append((nm, val(row, email_c), val(row, title_c), company))
+
+    people_cache = load_people_cache()
+    todo = [r for r in dict.fromkeys(rows) if any(r) and people_cache_key(*r) not in people_cache]
+    m1, m2 = st.columns(2)
+    m1.metric("People in file", sum(1 for r in rows if any(r)))
+    m2.metric("To look up", len(todo))
+
+    if st.button("Look up people", type="primary", disabled=not todo, key="bulk_run"):
+        li_cache = load_linkedin_cache()
+        meter = {"credits": 0}
+        bar, note = st.progress(0.0), st.empty()
+        for i, r in enumerate(todo):
+            if meter["credits"] + 3 > max_credits:
+                st.warning(f"Credit cap ({max_credits}) reached. Raise it and run again to continue.")
+                break
+            note.text(f"Looking up {r[0] or r[1] or r[2]} ({i + 1}/{len(todo)})")
+            try:
+                res = lookup_with_retry(lambda: lookup_person(*r, headers, meter, li_cache), note)
+            except requests.HTTPError as e:
+                res = {"status": "error", "note": f"HTTP {e.response.status_code}"}
+            except Exception as e:
+                res = {"status": "error", "note": str(e)}
+            res["inputs"] = dict(zip(("name", "email", "title", "company"), r))
+            if res.get("status") != "error":
+                people_cache[people_cache_key(*r)] = res
+                save_people_cache(people_cache)
+            bar.progress((i + 1) / len(todo))
+            time.sleep(delay)
+        note.text(f"Done. Apollo credits used this run: {meter['credits']}")
+        people_cache = load_people_cache()
+
+    out_rows = []
+    for r in rows:
+        res = people_cache.get(people_cache_key(*r)) if any(r) else None
+        p = (res or {}).get("person") or {}
+        status = (res or {}).get("status", "pending" if any(r) else "")
+        if res and not p and res.get("candidates"):
+            top = res["candidates"][0]
+            if top["match"] == "exact match" and len(res["candidates"]) == 1:
+                status = "found in search (no email yet)"
+                p = top
+        keep = (not exact_only) or status in ("exact match", "match (some details unverified)",
+                                              "found in search (no email yet)")
+        out_rows.append({
+            "found_name": p.get("name") if keep else None,
+            "found_title": p.get("title") if keep else None,
+            "found_company": p.get("company") if keep else None,
+            "found_email": p.get("email") if keep else None,
+            "email_status": p.get("email_status") if keep else None,
+            "found_linkedin": p.get("linkedin") if keep else None,
+            "match_status": status if keep or not p else f"{status} (hidden: exact only)",
+            "checks": checks_text((res or {}).get("checks") or p.get("checks") or {}),
+            "note": (res or {}).get("note"),
+        })
+    result = pd.concat([pdf.reset_index(drop=True), pd.DataFrame(out_rows)], axis=1)
+    st.dataframe(result, use_container_width=True, hide_index=True)
+    buf = io.BytesIO()
+    result.to_excel(buf, index=False)
+    st.download_button("Download results (Excel)", buf.getvalue(), "people_lookup.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       key="bulk_download")
+
+
+def people_lookup_tab():
+    st.caption("Look up specific people by name, email, title, and company domain or company LinkedIn page.")
+    mode = st.radio("Lookup type", ["One person", "A list of people"], horizontal=True, key="people_mode")
+    if mode == "One person":
+        single_person_lookup()
+    else:
+        bulk_person_lookup()
+    with st.expander("Saved people results"):
+        st.caption("Lookups are saved so repeats are free. Clear them to search again from scratch.")
+        if st.button("Clear saved people results", key="people_clear"):
+            save_people_cache({})
+            st.session_state.pop("person_result", None)
+            st.success("Cleared.")
+
+
 st.set_page_config(page_title="Buyer Finder", page_icon="📇", layout="wide")
 st.title("📇 Buyer Finder")
 st.caption("Upload a company list; Apollo finds candidates and Claude picks the best person to pitch.")
@@ -664,190 +1117,199 @@ webhook_url = f"{phone_hook}?token={phone_token}" if (reveal_phone and phone_hoo
 if reveal_phone and not webhook_url:
     st.sidebar.warning("Set PHONE_WEBHOOK_URL and PHONE_WEBHOOK_TOKEN in Secrets to enable phones.")
 
-file = st.file_uploader("Excel file with company domains", type=["xlsx"])
-if not file:
-    st.stop()
+def company_finder_tab():
+    """Original flow: upload companies, Apollo finds candidates, Claude picks the buyer."""
+    file = st.file_uploader("Excel file with company domains", type=["xlsx"])
+    if not file:
+        return
 
-df = pd.read_excel(file)
-columns = list(df.columns)
-id_mode = st.radio("How should companies be identified?",
-                   ["Website domain", "Company LinkedIn page"], horizontal=True)
-use_linkedin = id_mode == "Company LinkedIn page"
-li_cache = {}
+    df = pd.read_excel(file)
+    columns = list(df.columns)
+    id_mode = st.radio("How should companies be identified?",
+                       ["Website domain", "Company LinkedIn page"], horizontal=True)
+    use_linkedin = id_mode == "Company LinkedIn page"
+    li_cache = {}
 
-if not use_linkedin:
-    col = st.selectbox("Which column holds the domain?", columns)
-    df["_domain"] = df[col].map(clean_domain)
-else:
-    li_guess = next((c for c in columns if "linkedin" in str(c).lower()), columns[0])
-    col = st.selectbox("Which column holds the company LinkedIn URL?", columns,
-                       index=columns.index(li_guess))
-    check_options = ["(don't cross-check)"] + [c for c in columns if c != col]
-    domain_guess = next((c for c in check_options[1:]
-                         if any(k in str(c).lower() for k in ("domain", "website", "url"))
-                         and "linkedin" not in str(c).lower()), check_options[0])
-    check_col = st.selectbox("Domain column to cross-check against LinkedIn (optional)", check_options,
-                             index=check_options.index(domain_guess))
-    check_col = None if check_col == check_options[0] else check_col
+    if not use_linkedin:
+        col = st.selectbox("Which column holds the domain?", columns)
+        df["_domain"] = df[col].map(clean_domain)
+    else:
+        li_guess = next((c for c in columns if "linkedin" in str(c).lower()), columns[0])
+        col = st.selectbox("Which column holds the company LinkedIn URL?", columns,
+                           index=columns.index(li_guess))
+        check_options = ["(don't cross-check)"] + [c for c in columns if c != col]
+        domain_guess = next((c for c in check_options[1:]
+                             if any(k in str(c).lower() for k in ("domain", "website", "url"))
+                             and "linkedin" not in str(c).lower()), check_options[0])
+        check_col = st.selectbox("Domain column to cross-check against LinkedIn (optional)", check_options,
+                                 index=check_options.index(domain_guess))
+        check_col = None if check_col == check_options[0] else check_col
 
-    li_cache = load_linkedin_cache()
-    df["_linkedin"] = df[col].map(normalize_linkedin)
-    urls = list(dict.fromkeys(df["_linkedin"].dropna()))
-    unchecked = [u for u in urls if u not in li_cache or li_cache[u].get("status") == "error"]
-    bad_urls = int((df[col].notna() & df["_linkedin"].isna()).sum())
+        li_cache = load_linkedin_cache()
+        df["_linkedin"] = df[col].map(normalize_linkedin)
+        urls = list(dict.fromkeys(df["_linkedin"].dropna()))
+        unchecked = [u for u in urls if u not in li_cache or li_cache[u].get("status") == "error"]
+        bad_urls = int((df[col].notna() & df["_linkedin"].isna()).sum())
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("LinkedIn pages", len(urls))
-    k2.metric("Matched", sum(1 for u in urls if (li_cache.get(u) or {}).get("status") == "matched"))
-    k3.metric("Not matched", sum(1 for u in urls if (li_cache.get(u) or {}).get("status") == "not_matched"))
-    k4.metric("To check", len(unchecked))
-    if bad_urls:
-        st.warning(f"{bad_urls} rows don't contain a LinkedIn company URL "
-                   "(linkedin.com/company/...). Personal profiles (/in/) can't identify a company.")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("LinkedIn pages", len(urls))
+        k2.metric("Matched", sum(1 for u in urls if (li_cache.get(u) or {}).get("status") == "matched"))
+        k3.metric("Not matched", sum(1 for u in urls if (li_cache.get(u) or {}).get("status") == "not_matched"))
+        k4.metric("To check", len(unchecked))
+        if bad_urls:
+            st.warning(f"{bad_urls} rows don't contain a LinkedIn company URL "
+                       "(linkedin.com/company/...). Personal profiles (/in/) can't identify a company.")
 
-    if st.button("Check companies on LinkedIn", disabled=not unchecked,
-                 help="Matches each LinkedIn page to Apollo's company record. "
-                      "May use Apollo credits (1-2 searches per company), counted toward your cap."):
-        li_meter = {"credits": 0}
-        li_bar = st.progress(0.0)
-        li_status = st.empty()
-        for i, u in enumerate(unchecked):
-            if li_meter["credits"] + 2 > max_credits:
-                st.warning(f"Credit cap ({max_credits}) reached. Raise it and check again to continue.")
+        if st.button("Check companies on LinkedIn", disabled=not unchecked,
+                     help="Matches each LinkedIn page to Apollo's company record. "
+                          "May use Apollo credits (1-2 searches per company), counted toward your cap."):
+            li_meter = {"credits": 0}
+            li_bar = st.progress(0.0)
+            li_status = st.empty()
+            for i, u in enumerate(unchecked):
+                if li_meter["credits"] + 2 > max_credits:
+                    st.warning(f"Credit cap ({max_credits}) reached. Raise it and check again to continue.")
+                    break
+                li_status.text(f"Checking {u} ({i + 1}/{len(unchecked)})")
+                for attempt in range(3):
+                    try:
+                        li_cache[u] = resolve_linkedin_company(u, headers, li_meter)
+                        break
+                    except requests.HTTPError as e:
+                        code = e.response.status_code
+                        if code == 429 and attempt < 2:
+                            li_status.text("Apollo rate limit, waiting 60s...")
+                            time.sleep(60)
+                            continue
+                        li_cache[u] = {"status": "error", "note": f"HTTP {code}"}
+                        break
+                    except Exception as e:
+                        li_cache[u] = {"status": "error", "note": str(e)}
+                        break
+                save_linkedin_cache(li_cache)
+                li_bar.progress((i + 1) / len(unchecked))
+                time.sleep(delay)
+            st.rerun()
+
+        df["_domain"] = df["_linkedin"].map(lambda u: (li_cache.get(u) or {}).get("domain")
+                                            if (li_cache.get(u) or {}).get("status") == "matched" else None)
+
+        checked = [u for u in urls if u in li_cache]
+        if checked:
+            with st.expander("🔎 Company check (from LinkedIn)", expanded=True):
+                rows = []
+                listed = (df.dropna(subset=["_linkedin"]).drop_duplicates("_linkedin")
+                          .set_index("_linkedin")[check_col].map(clean_domain)) if check_col else {}
+                for u in checked:
+                    info = li_cache[u]
+                    row = {"LinkedIn": u, "Status": info.get("status"), "Company": info.get("company_name"),
+                           "Domain": info.get("domain"), "Employees": info.get("employees"),
+                           "Industry": info.get("industry"), "Location": info.get("location"),
+                           "Note": info.get("note")}
+                    if check_col:
+                        agree = domains_agree(listed.get(u), info.get("domain"))
+                        row["Listed domain"] = listed.get(u)
+                        row["Domain check"] = {True: "matches", False: "differs", None: ""}[agree]
+                    rows.append(row)
+                check_df = pd.DataFrame(rows)
+                st.dataframe(check_df, use_container_width=True, hide_index=True)
+                if check_col and (check_df["Domain check"] == "differs").any():
+                    st.warning("Some listed domains differ from the company's LinkedIn. "
+                               "The LinkedIn match is used for the lookup.")
+
+    domains = list(dict.fromkeys(df["_domain"].dropna()))
+
+    show_personnel(df, company_col=col)
+
+    cache = load_cache()
+    # Errored lookups are retried; found and not_found results are kept.
+    todo = [d for d in domains if d not in cache or "error" in cache[d]]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Unique companies", len(domains))
+    c2.metric("Already cached (free)", len(domains) - len(todo))
+    c3.metric("To look up", len(todo))
+
+    if st.button("Run lookup", type="primary", disabled=not todo):
+        client = anthropic.Anthropic(api_key=claude_key)
+        bar = st.progress(0.0)
+        status = st.empty()
+        meter = {"credits": 0}
+        for i, d in enumerate(todo):
+            if meter["credits"] + shortlist_k > max_credits:
+                st.warning(f"Credit cap ({max_credits}) reached. Raise it and run again to continue.")
                 break
-            li_status.text(f"Checking {u} ({i + 1}/{len(unchecked)})")
+            status.text(f"Looking up {d} ({i + 1}/{len(todo)})")
             for attempt in range(3):
                 try:
-                    li_cache[u] = resolve_linkedin_company(u, headers, li_meter)
+                    result = find_best_contact(d, headers, client, model, pitch, shortlist_k, webhook_url, meter)
+                    cache[d] = result or {"not_found": True}
                     break
                 except requests.HTTPError as e:
                     code = e.response.status_code
                     if code == 429 and attempt < 2:
-                        li_status.text("Apollo rate limit, waiting 60s...")
+                        status.text("Apollo rate limit, waiting 60s...")
                         time.sleep(60)
                         continue
-                    li_cache[u] = {"status": "error", "note": f"HTTP {code}"}
+                    cache[d] = {"error": f"HTTP {code}"}
                     break
                 except Exception as e:
-                    li_cache[u] = {"status": "error", "note": str(e)}
+                    cache[d] = {"error": str(e)}
                     break
-            save_linkedin_cache(li_cache)
-            li_bar.progress((i + 1) / len(unchecked))
+            save_cache(cache)
+            bar.progress((i + 1) / len(todo))
             time.sleep(delay)
-        st.rerun()
+        status.text(f"Done. Apollo enrichment credits used this run: {meter['credits']} (phone reveals not included)")
 
-    df["_domain"] = df["_linkedin"].map(lambda u: (li_cache.get(u) or {}).get("domain")
-                                        if (li_cache.get(u) or {}).get("status") == "matched" else None)
-
-    checked = [u for u in urls if u in li_cache]
-    if checked:
-        with st.expander("🔎 Company check (from LinkedIn)", expanded=True):
-            rows = []
-            listed = (df.dropna(subset=["_linkedin"]).drop_duplicates("_linkedin")
-                      .set_index("_linkedin")[check_col].map(clean_domain)) if check_col else {}
-            for u in checked:
-                info = li_cache[u]
-                row = {"LinkedIn": u, "Status": info.get("status"), "Company": info.get("company_name"),
-                       "Domain": info.get("domain"), "Employees": info.get("employees"),
-                       "Industry": info.get("industry"), "Location": info.get("location"),
-                       "Note": info.get("note")}
-                if check_col:
-                    agree = domains_agree(listed.get(u), info.get("domain"))
-                    row["Listed domain"] = listed.get(u)
-                    row["Domain check"] = {True: "matches", False: "differs", None: ""}[agree]
-                rows.append(row)
-            check_df = pd.DataFrame(rows)
-            st.dataframe(check_df, use_container_width=True, hide_index=True)
-            if check_col and (check_df["Domain check"] == "differs").any():
-                st.warning("Some listed domains differ from the company's LinkedIn. "
-                           "The LinkedIn match is used for the lookup.")
-
-domains = list(dict.fromkeys(df["_domain"].dropna()))
-
-show_personnel(df, company_col=col)
-
-cache = load_cache()
-# Errored lookups are retried; found and not_found results are kept.
-todo = [d for d in domains if d not in cache or "error" in cache[d]]
-c1, c2, c3 = st.columns(3)
-c1.metric("Unique companies", len(domains))
-c2.metric("Already cached (free)", len(domains) - len(todo))
-c3.metric("To look up", len(todo))
-
-if st.button("Run lookup", type="primary", disabled=not todo):
-    client = anthropic.Anthropic(api_key=claude_key)
-    bar = st.progress(0.0)
-    status = st.empty()
-    meter = {"credits": 0}
-    for i, d in enumerate(todo):
-        if meter["credits"] + shortlist_k > max_credits:
-            st.warning(f"Credit cap ({max_credits}) reached. Raise it and run again to continue.")
-            break
-        status.text(f"Looking up {d} ({i + 1}/{len(todo)})")
-        for attempt in range(3):
-            try:
-                result = find_best_contact(d, headers, client, model, pitch, shortlist_k, webhook_url, meter)
-                cache[d] = result or {"not_found": True}
-                break
-            except requests.HTTPError as e:
-                code = e.response.status_code
-                if code == 429 and attempt < 2:
-                    status.text("Apollo rate limit, waiting 60s...")
-                    time.sleep(60)
-                    continue
-                cache[d] = {"error": f"HTTP {code}"}
-                break
-            except Exception as e:
-                cache[d] = {"error": str(e)}
-                break
+    if st.button("Fetch phone numbers received so far"):
+        stats = fetch_phones(cache)
         save_cache(cache)
-        bar.progress((i + 1) / len(todo))
-        time.sleep(delay)
-    status.text(f"Done. Apollo enrichment credits used this run: {meter['credits']} (phone reveals not included)")
+        if "error" in stats:
+            st.error(stats["error"])
+        else:
+            st.success(
+                f"{stats['payloads']} payloads received, {stats['phone_records']} contain phone numbers, "
+                f"{stats['updated']} matched to your contacts "
+                f"({stats['cached_with_id']} cached contacts have an Apollo ID to match on)."
+            )
+            if stats["phone_records"] and not stats["updated"]:
+                st.warning("Phones arrived but none matched. Compare the IDs below with your cache.")
+                with st.expander("Last payload received"):
+                    st.json(stats["sample"])
 
-if st.button("Fetch phone numbers received so far"):
-    stats = fetch_phones(cache)
-    save_cache(cache)
-    if "error" in stats:
-        st.error(stats["error"])
-    else:
-        st.success(
-            f"{stats['payloads']} payloads received, {stats['phone_records']} contain phone numbers, "
-            f"{stats['updated']} matched to your contacts "
-            f"({stats['cached_with_id']} cached contacts have an Apollo ID to match on)."
-        )
-        if stats["phone_records"] and not stats["updated"]:
-            st.warning("Phones arrived but none matched. Compare the IDs below with your cache.")
-            with st.expander("Last payload received"):
-                st.json(stats["sample"])
+    # Merge cache back onto the original rows
+    out = df.copy()
+    for k in ("name", "title", "email", "email_status", "linkedin", "phone",
+              "confidence", "rationale", "pitch_angle", "alternates", "picked_by"):
+        out[f"contact_{k}"] = out["_domain"].map(lambda d, k=k: (cache.get(d) or {}).get(k))
+    out["lookup_status"] = out["_domain"].map(lambda d: status_of(cache, d))
+    if use_linkedin:
+        li_info = out["_linkedin"].map(lambda u: li_cache.get(u) or {})
+        out["linkedin_company"] = li_info.map(lambda i: i.get("company_name"))
+        out["linkedin_domain"] = li_info.map(lambda i: i.get("domain"))
+        out["linkedin_employees"] = li_info.map(lambda i: i.get("employees"))
+        out["linkedin_industry"] = li_info.map(lambda i: i.get("industry"))
+        li_state = li_info.map(lambda i: i.get("status"))
+        no_domain = out["_domain"].isna()
+        out.loc[no_domain & out["_linkedin"].isna(), "lookup_status"] = "linkedin_invalid"
+        out.loc[no_domain & out["_linkedin"].notna() & li_state.isna(), "lookup_status"] = "linkedin_unchecked"
+        out.loc[no_domain & (li_state == "not_matched"), "lookup_status"] = "linkedin_not_matched"
+        out.loc[no_domain & (li_state == "error"), "lookup_status"] = "linkedin_error"
+    out = out.drop(columns=[c for c in ("_domain", "_linkedin") if c in out])
 
-# Merge cache back onto the original rows
-out = df.copy()
-for k in ("name", "title", "email", "email_status", "linkedin", "phone",
-          "confidence", "rationale", "pitch_angle", "alternates", "picked_by"):
-    out[f"contact_{k}"] = out["_domain"].map(lambda d, k=k: (cache.get(d) or {}).get(k))
-out["lookup_status"] = out["_domain"].map(lambda d: status_of(cache, d))
-if use_linkedin:
-    li_info = out["_linkedin"].map(lambda u: li_cache.get(u) or {})
-    out["linkedin_company"] = li_info.map(lambda i: i.get("company_name"))
-    out["linkedin_domain"] = li_info.map(lambda i: i.get("domain"))
-    out["linkedin_employees"] = li_info.map(lambda i: i.get("employees"))
-    out["linkedin_industry"] = li_info.map(lambda i: i.get("industry"))
-    li_state = li_info.map(lambda i: i.get("status"))
-    no_domain = out["_domain"].isna()
-    out.loc[no_domain & out["_linkedin"].isna(), "lookup_status"] = "linkedin_invalid"
-    out.loc[no_domain & out["_linkedin"].notna() & li_state.isna(), "lookup_status"] = "linkedin_unchecked"
-    out.loc[no_domain & (li_state == "not_matched"), "lookup_status"] = "linkedin_not_matched"
-    out.loc[no_domain & (li_state == "error"), "lookup_status"] = "linkedin_error"
-out = out.drop(columns=[c for c in ("_domain", "_linkedin") if c in out])
+    st.subheader("Results")
+    status_options = ["found", "not_found", "error", "pending"] + sorted(
+        s for s in out["lookup_status"].dropna().unique() if s.startswith("linkedin_"))
+    choice = st.multiselect("Filter by status", status_options, default=status_options)
+    st.dataframe(out[out["lookup_status"].isin(choice)], use_container_width=True)
 
-st.subheader("Results")
-status_options = ["found", "not_found", "error", "pending"] + sorted(
-    s for s in out["lookup_status"].dropna().unique() if s.startswith("linkedin_"))
-choice = st.multiselect("Filter by status", status_options, default=status_options)
-st.dataframe(out[out["lookup_status"].isin(choice)], use_container_width=True)
+    buf = io.BytesIO()
+    out.to_excel(buf, index=False)
+    st.download_button("Download Excel", buf.getvalue(), "companies_enriched.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-buf = io.BytesIO()
-out.to_excel(buf, index=False)
-st.download_button("Download Excel", buf.getvalue(), "companies_enriched.xlsx",
-                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+tab_companies, tab_people = st.tabs(["🏢 Find buyers by company", "🔍 Look up people"])
+with tab_companies:
+    company_finder_tab()
+with tab_people:
+    people_lookup_tab()
