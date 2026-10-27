@@ -27,7 +27,7 @@ TARGET_TITLES = [
 SENIORITIES = ["owner", "founder", "c_suite", "vp", "head", "director", "manager"]
 
 # Fallback only, used if the Claude call fails.
-#TITLE_SCORES = [
+TITLE_SCORES = [
     ("finance operations", 100), ("financial operations", 100), ("controller", 90),
     ("business systems", 85), ("billing", 85), ("revenue operations", 80), ("erp", 80),
     ("vp finance", 75), ("vp, finance", 75), ("head of finance", 75), ("crm", 70),
